@@ -36,6 +36,18 @@ header{position:sticky;top:0;z-index:10;background:var(--card);border-bottom:1px
 .pno{position:absolute;right:6px;top:6px;background:rgba(0,0,0,.6);color:#fff;font-size:14px;padding:2px 8px;border-radius:6px;pointer-events:none}
 #hint{padding:40px 20px;text-align:center;color:#5a6370;font-size:18px;line-height:1.8}
 body.pick .page{outline:4px dashed var(--blue)}
+#card{margin-top:8px;border:3px solid var(--blue);border-radius:12px;padding:10px 14px;background:#fff}
+#card .loc{font-size:40px;font-weight:800;line-height:1.1}
+#card .loc b{color:var(--blue)}
+#card .jan{font:700 30px/1.2 ui-monospace,Menlo,monospace;letter-spacing:.04em;margin-top:4px}
+#card .jan span{color:var(--ng)}
+#card .name{font-size:28px;font-weight:700;margin-top:4px;line-height:1.25}
+#card img{display:block;width:100%;max-height:90px;object-fit:contain;object-position:left center;margin-top:6px;border:1px solid var(--line);border-radius:6px;background:#fff}
+#card .qty{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin-top:6px;font-size:24px;font-weight:700}
+#card .qty .big{font-size:56px;font-weight:800;line-height:1}
+#card .qty .rem{font-size:40px;font-weight:800}
+#card.ok{border-color:var(--ok)} #card.ok .rem{color:var(--ok)}
+#card.warn .rem{color:var(--warn)} #card.ng{border-color:var(--ng)} #card.ng .rem{color:var(--ng)}
 .cam{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9;width:100%;max-width:440px;margin-top:8px}
 .cam video{width:100%;height:100%;object-fit:cover;display:block}
 .cam::after{content:"";position:absolute;left:8%;right:8%;top:50%;height:2px;background:#ff5a3c;box-shadow:0 0 8px #ff5a3c}
@@ -53,6 +65,7 @@ body.pick .page{outline:4px dashed var(--blue)}
   </div>
   <div id="last"><small>📷でJANを読むか、「123456」と話すと場所を答えるので、続けて数を話します。<br>例:「123456 3」= JAN下6桁と数。「123456」だけなら場所を答えて数を待ちます。「取り消し」「残り」も使えます。</small></div>
   <div class="cam" id="cam" hidden><video id="video" playsinline muted autoplay></video></div>
+  <div id="card" hidden></div>
   <div id="manual" class="row">
     <input id="inJan" inputmode="numeric" maxlength="6" placeholder="JAN下6桁" autocomplete="off">
     <input id="inQty" inputmode="numeric" maxlength="5" placeholder="数" autocomplete="off">
@@ -108,7 +121,7 @@ async function openPdf(file){
   pagesEl.innerHTML='<div id="hint">読み込み中…</div>';
   const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer(),cMapUrl:'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',cMapPacked:true,standardFontDataUrl:'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/'}).promise;
   key='kenpin:'+file.name+':'+file.size;
-  pagesEl.innerHTML='';rows=[];pagesInfo=[];log=[];pending=null;lastRow=null;
+  pagesEl.innerHTML='';rows=[];pagesInfo=[];log=[];pending=null;lastRow=null;showCard(null);
   const W=Math.min(pagesEl.clientWidth-8,1200);
   let lastHeaderX=null,usedOcr=false,ocrFailed=false,lastQcol=null,lastJcol=null;const sumWarn=[],ocrPages=[];let okPages=0,docHit=null;
   for(let p=1;p<=pdf.numPages;p++){
@@ -170,7 +183,7 @@ async function openPdf(file){
         rows.push(r);
       }
       ocrPages.push({p,ocrImg,qcol,found,lines});
-      pagesInfo.push({svg,scale,wrap,page:p,ocrImg,qcol});
+      pagesInfo.push({svg,scale,wrap,page:p,ocrImg,qcol,cv,dpr});
       wrap.addEventListener('click',e=>onPageTap(p,e));
       continue;
     }
@@ -184,9 +197,10 @@ async function openPdf(file){
       const r={page:p,no,jan,bad,jan6:jan.slice(-6),need:null,got:0,y:l.y,h:l.h,items:l.items,
         x0:Math.min(...l.items.map(i=>i.x)),x1:Math.max(...l.items.map(i=>i.x+i.w))};
       r.need=qtyAt(r,headerX);
+      r.name=nameOf(r,headerX);
       rows.push(r);
     }
-    pagesInfo.push({svg,scale,wrap,page:p});
+    pagesInfo.push({svg,scale,wrap,page:p,cv,dpr,hx:headerX});
     wrap.addEventListener('click',e=>onPageTap(p,e));
   }
   fixByPrefix();
@@ -486,6 +500,13 @@ function reconcile(prs,total){
   return false;
 }
 
+function nameOf(r,hx){
+  const k=r.items.findIndex(i=>i.s.includes(r.jan));
+  let its=r.items.filter((it,i)=>i>k&&(hx==null||it.x+it.w<hx-6));
+  if(its.length&&/^\d{3,7}$/.test(its[0].s))its=its.slice(1);   // 品番
+  while(its.length>1&&/^[\d,]+$/.test(its[its.length-1].s))its.pop();   // 入数など
+  return its.map(i=>i.s).join(' ').replace(/\s+/g,' ').trim();
+}
 function qtyAt(r,hx){
   if(hx==null)return null;
   let best=null,bd=1e9;
@@ -557,9 +578,9 @@ function findRow(j6,full){
 const where=r=>`${r.page}枚目、${r.no}行目`;
 function apply(j6,q,full){
   const r=findRow(j6,full);
-  if(!r){pending=null;say(`${j6.split('').join(' ')}、ありません`);showLast(`${j6} は納品書にありません`,'','ng');return;}
+  if(!r){pending=null;showCard(null);say(`${j6.split('').join(' ')}、ありません`);showLast(`${j6} は納品書にありません`,'','ng');return;}
   if(q==null){
-    pending=j6;lastRow=r;redrawAll();scrollToRow(r);
+    pending=j6;lastRow=r;redrawAll();scrollToRow(r);showCard(r,'');
     const rest=r.need==null?'':`、あと${r.need-r.got}個`;
     say(`${where(r)}${rest}。数は？`);
     showLast(`${where(r)} … 数を話してください`,`JAN …${j6}`,'');
@@ -576,6 +597,7 @@ function apply(j6,q,full){
   const done=allDone();
   if(done)msg+='。全部そろいました。OK';
   say(msg);
+  showCard(r,cls||'warn');
   showLast(msg.replace(/。/g,' '),`JAN …${j6} +${q}(${r.got}/${r.need??'?'})`,cls);
 }
 function undo(){
@@ -584,6 +606,7 @@ function undo(){
   const r=rows[L.i];r.got-=L.q;lastRow=r;pending=null;
   save();redrawAll();updateStatus();scrollToRow(r);
   say(`取り消しました。${where(r)}`);
+  showCard(r);
   showLast(`取り消し:${where(r)} −${L.q}`,'','');
 }
 function totals(){
@@ -610,7 +633,34 @@ function updateStatus(){
   const t=totals();s.className='';
   s.textContent=`残り ${t.rem}個 / ${t.openRows}行`+(t.over?` ・超過${t.over}行`:'')+(t.unknown?` ・数量不明${t.unknown}行`:'');
 }
-function showLast(main,sub,cls){const el=$('last');el.className=cls||'';el.innerHTML=`${main}${sub?`<small>${sub}</small>`:''}`;}
+function rowImage(r){
+  try{
+    const P=pagesInfo[r.page-1];if(!P||!P.cv)return '';
+    const k=P.scale*P.dpr,hh=Math.max(r.h,6);
+    const x0=Math.max(0,(r.x0-3)*k),x1=Math.min(P.cv.width,(r.x1+3)*k);
+    const y0=Math.max(0,(r.y-hh*1.6)*k),y1=Math.min(P.cv.height,(r.y+hh*0.8)*k);
+    const c=document.createElement('canvas');c.width=Math.round(x1-x0);c.height=Math.round(y1-y0);
+    c.getContext('2d').drawImage(P.cv,x0,y0,x1-x0,y1-y0,0,0,c.width,c.height);
+    return c.toDataURL('image/jpeg',0.85);
+  }catch(e){return '';}
+}
+function showCard(r,cls){
+  const el=$('card');
+  if(!r){el.hidden=true;return;}
+  const rem=r.need==null?null:r.need-r.got;
+  const remTxt=rem==null?'数量?':rem>0?`あと ${rem}`:rem===0?'OK':`${-rem} 多い`;
+  const esc=t=>String(t).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const img=rowImage(r);
+  el.className=cls||(rem===0?'ok':rem!=null&&rem<0?'ng':'warn');
+  el.innerHTML=`<div class="loc"><b>${r.page}</b>枚目 <b>${r.no}</b>行目</div>
+    <div class="jan">${esc(r.jan.slice(0,-6))}<span>${esc(r.jan6)}</span>${r.bad?' <small style="font-size:18px;color:#7c3aed">(JAN?)</small>':''}</div>
+    ${r.name?`<div class="name">${esc(r.name)}</div>`:''}
+    ${img?`<img src="${img}" alt="">`:''}
+    <div class="qty"><span>数 <span class="big">${r.need??'?'}</span></span><span>検品 ${r.got}</span><span class="rem">${remTxt}</span></div>`;
+  el.hidden=false;
+  setTimeout(()=>{$('last').hidden=true;},0);
+}
+function showLast(main,sub,cls){const el=$('last');el.hidden=false;el.className=cls||'';el.innerHTML=`${main}${sub?`<small>${sub}</small>`:''}`;}
 
 /* ---------- 線を引く ---------- */
 function redrawAll(){pagesInfo.forEach(P=>drawPage(P));}
@@ -655,7 +705,7 @@ function restore(){
 }
 $('resetBtn').onclick=()=>{
   if(!rows.length||!confirm('検品数をすべて0に戻しますか?'))return;
-  rows.forEach(r=>r.got=0);log=[];pending=null;lastRow=null;save();redrawAll();updateStatus();showLast('最初からやり直します','','');
+  rows.forEach(r=>r.got=0);log=[];pending=null;lastRow=null;showCard(null);save();redrawAll();updateStatus();showLast('最初からやり直します','','');
 };
 
 /* ---------- 手入力 ---------- */
