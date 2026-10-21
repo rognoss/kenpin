@@ -61,6 +61,7 @@ body.pick .page{outline:4px dashed var(--blue)}
     <label class="btn">納品書PDF<input type="file" id="file" accept="application/pdf" hidden></label>
     <button id="camBtn" class="btn scan">📷 読む</button>
     <button id="micBtn" class="btn mic">🎤 話す</button>
+    <button id="sayBtn" class="btn" title="もう一度読み上げ">🔊</button>
     <div id="status">PDFを開いてください</div>
   </div>
   <div id="last"><small>📷でJANを読むか、「123456」と話すと場所を答えるので、続けて数を話します。<br>例:「123456 3」= JAN下6桁と数。「123456」だけなら場所を答えて数を待ちます。「取り消し」「残り」も使えます。</small></div>
@@ -833,13 +834,25 @@ document.addEventListener('visibilitychange',()=>{if(document.hidden&&stream)sto
 /* ---------- 音声 ---------- */
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 let rec=null,listening=false,speaking=false;
+/* 読み上げ:iPadは最初の1回を画面タッチの中で鳴らす必要がある */
+let jaVoice=null,lastSay='',speechReady=false;
+function pickVoice(){try{const v=speechSynthesis.getVoices();jaVoice=v.find(x=>/ja[-_]JP/i.test(x.lang)&&/Kyoko|O-ren|Hattori/i.test(x.name))||v.find(x=>/^ja/i.test(x.lang))||null;}catch(e){}}
+if('speechSynthesis' in window){pickVoice();try{speechSynthesis.onvoiceschanged=pickVoice;}catch(e){}}
+function unlockSpeech(){
+  if(speechReady||!('speechSynthesis' in window))return;
+  try{const u=new SpeechSynthesisUtterance(' ');u.lang='ja-JP';u.volume=0;if(jaVoice)u.voice=jaVoice;speechSynthesis.speak(u);speechReady=true;}catch(e){}
+}
+document.addEventListener('pointerdown',()=>{unlockSpeech();unlockSound();},{capture:true});
+document.addEventListener('touchend',()=>{unlockSpeech();},{capture:true,once:true});
 function say(t){
   if(!('speechSynthesis' in window))return;
-  speechSynthesis.cancel();
-  const u=new SpeechSynthesisUtterance(t);u.lang='ja-JP';u.rate=1.1;
+  lastSay=t;
+  try{if(speechSynthesis.speaking||speechSynthesis.pending)speechSynthesis.cancel();}catch(e){}
+  try{speechSynthesis.resume();}catch(e){}
+  const u=new SpeechSynthesisUtterance(t);u.lang='ja-JP';u.rate=1.1;u.volume=1;if(jaVoice)u.voice=jaVoice;
   speaking=true;try{rec&&rec.abort();}catch(e){}
   u.onend=u.onerror=()=>{speaking=false;if(listening)setTimeout(startRec,250);};
-  speechSynthesis.speak(u);
+  if(listening)setTimeout(()=>speechSynthesis.speak(u),200);else speechSynthesis.speak(u);
 }
 function startRec(){try{rec&&rec.start();}catch(e){}}
 function handleText(t){
@@ -864,6 +877,7 @@ $('micBtn').onclick=()=>{
   listening=true;updMic();
   say('どうぞ');
 };
+$('sayBtn').onclick=()=>{unlockSpeech();say(lastSay||'読み上げのテストです');};
 function updMic(){const b=$('micBtn');b.classList.toggle('on',listening);b.textContent=listening?'■ 止める':'🎤 話す';}
 </script>
 </body>
