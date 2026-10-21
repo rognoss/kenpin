@@ -110,7 +110,7 @@ async function openPdf(file){
   key='kenpin:'+file.name+':'+file.size;
   pagesEl.innerHTML='';rows=[];pagesInfo=[];log=[];pending=null;lastRow=null;
   const W=Math.min(pagesEl.clientWidth-8,1200);
-  let lastHeaderX=null,usedOcr=false,ocrFailed=false;
+  let lastHeaderX=null,usedOcr=false,ocrFailed=false,lastQcol=null,lastJcol=null;const sumWarn=[],ocrPages=[];let okPages=0;
   for(let p=1;p<=pdf.numPages;p++){
     const page=await pdf.getPage(p);
     const vp1=page.getViewport({scale:1});
@@ -133,7 +133,7 @@ async function openPdf(file){
       const [x,y]=vp1.convertToViewportPoint(i.transform[4],i.transform[5]);
       return {s:z2h(i.str.trim()),x,y,w:i.width||0,h:Math.hypot(i.transform[2],i.transform[3])||10};
     });
-    let ocrImg=null;
+    let ocrImg=null,qcol=null,jcol=null;
     if(!pageHasJan(items)){
       try{ocrImg=await ocrPage(page,vp1,p,pdf.numPages);items=ocrImg.items;usedOcr=true;}
       catch(e){ocrFailed=true;}
@@ -151,6 +151,29 @@ async function openPdf(file){
     if(headerX==null)headerX=lastHeaderX;else lastHeaderX=headerX;
 
     let no=0;
+    if(ocrImg){
+      for(const l of lines){if(!qcol)qcol=findCol(l.items,QTY_RE);if(!jcol)jcol=findCol(l.items,/JAN/i);}
+      if(!qcol&&jcol){
+        const hl=lines.filter(l=>Math.abs(l.y-jcol.y)<12).flatMap(l=>l.items).sort((a,b)=>a.x-b.x);
+        const i=hl.findIndex((it,k)=>/数/.test(it.s)&&!/[号入]数/.test(it.s)&&!(k>0&&/[号入]$/.test(hl[k-1].s))&&it.x>jcol.x1+120);
+        if(i>=0){const a=(i>0&&hl[i].s.length===1&&hl[i-1].s.length===1&&hl[i].x-hl[i-1].x-hl[i-1].w<20)?hl[i-1]:hl[i];qcol={x0:a.x,x1:hl[i].x+hl[i].w,cx:(a.x+hl[i].x+hl[i].w)/2,y:hl[i].y,weak:true};}
+      }
+      if(qcol)lastQcol=qcol;else qcol=lastQcol;
+      if(jcol)lastJcol=jcol;else jcol=lastJcol;
+      const found=await ocrJanRows(ocrImg,lines,jcol,vp1.width,p,pdf.numPages);
+      for(const f of found){
+        no++;
+        const ln=lines.reduce((a,l)=>Math.abs(l.y-f.y)<(a?Math.abs(a.y-f.y):12)?l:a,null);
+        const its=ln?ln.items:[];
+        const r={page:p,no,jan:f.jan,bad:f.bad,jan6:f.jan.slice(-6),need:null,got:0,y:f.y,y0:f.y0,h:f.h,items:its,
+          x0:f.x0,x1:Math.max(f.x1,qcol?qcol.x1+4:0,...its.map(i=>i.x+i.w))};
+        rows.push(r);
+      }
+      ocrPages.push({p,ocrImg,qcol,found,lines});
+      pagesInfo.push({svg,scale,wrap,page:p,ocrImg,qcol});
+      wrap.addEventListener('click',e=>onPageTap(p,e));
+      continue;
+    }
     for(const l of lines){
       const txt=l.items.map(i=>i.s).join(' ');
       let jan=null,bad=false,m=txt.match(/(^|\D)(\d{13}|4[59]\d{6})(?!\d)/);
@@ -161,16 +184,41 @@ async function openPdf(file){
       const r={page:p,no,jan,bad,jan6:jan.slice(-6),need:null,got:0,y:l.y,h:l.h,items:l.items,
         x0:Math.min(...l.items.map(i=>i.x)),x1:Math.max(...l.items.map(i=>i.x+i.w))};
       r.need=qtyAt(r,headerX);
-      if(r.need==null&&ocrImg&&headerX!=null)r.need=await ocrQty(ocrImg,r,headerX);
       rows.push(r);
     }
     pagesInfo.push({svg,scale,wrap,page:p});
     wrap.addEventListener('click',e=>onPageTap(p,e));
   }
+  fixByPrefix();
+  /* 数量:見出しが読めたページの列位置を、読めなかったページにも使う */
+  const docQ=(ocrPages.find(o=>o.qcol&&!o.qcol.weak)||ocrPages.find(o=>o.qcol)||{}).qcol;
+  for(const o of ocrPages){
+    const src=ocrPages.find(x=>x.qcol===docQ);
+    const dx=(src&&o.found.cx0!=null&&src.found.cx0!=null)?o.found.cx0-src.found.cx0:0;
+    const q=(o.qcol&&!o.qcol.weak)?o.qcol:(docQ?{...docQ,x0:docQ.x0+dx,x1:docQ.x1+dx,cx:docQ.cx+dx}:o.qcol);
+    if(!q)continue;
+    pagesInfo[o.p-1].qcol=q;
+    const prs=rows.filter(r=>r.page===o.p);
+    for(let i=0;i<prs.length;i++){
+      showLast(`枚数を読み取り中… ${o.p}/${pdf.numPages}枚目 ${i+1}/${prs.length}`,'','warn');
+      prs[i].need=await ocrQty(o.ocrImg,prs[i],q);
+    }
+    if(!prs.length)continue;
+    const last=o.found[o.found.length-1],nb=(o.found.bands||[]).find(b=>b.y0>last.y+2);
+    const tl=o.lines.find(l=>/合計/.test(l.items.map(i=>i.s).join('')));
+    const tb=tl?{y:tl.y,h:Math.max(tl.h,8)}:(nb&&nb.y0-last.y<last.h*4?{y:nb.y1,y0:nb.y0,h:nb.y1-nb.y0}:null);
+    const t=tb?await ocrQty(o.ocrImg,tb,q):null;
+    const mx=Math.max(0,...prs.map(r=>r.need||0));
+    if(t!=null&&t>=mx&&prs.length>1){
+      if(reconcile(prs,t))okPages++;
+      else sumWarn.push(`${o.p}枚目 合計${t}・読取${prs.reduce((a,r)=>a+(r.need||0),0)}`);
+    }
+  }
   restore();
   redrawAll();updateStatus();
   if(!rows.length) showLast('JANが見つかりません',ocrFailed?'読み取りの部品を読み込めませんでした。電波のある所でもう一度開いてください。':'スキャンが薄い・傾いている可能性があります。読めない行はJANと数を手入力してください。','ng');
-  else if(usedOcr) showLast(`スキャンから${rows.length}行 読み取りました`,'読み違いがあり得ます。紫の「JAN?」・青の「数量?」の行はタップして直してください。'+(rows.some(r=>r.need==null)?' 数量が読めない行は「数量列を指定」も使えます。':''),'warn');
+  else if(usedOcr&&sumWarn.length) showLast(`スキャンから${rows.length}行 読み取り(合計が合いません)`,sumWarn.join('、')+'。「数量?」や数の違う行をタップして直してください。','ng');
+  else if(usedOcr) showLast(`スキャンから${rows.length}行 読み取りました`+(okPages&&!rows.some(r=>r.bad||r.need==null)?'(合計も一致)':''),'読み違いがあり得ます。紫の「JAN?」・青の「数量?」の行はタップして直してください。'+(rows.some(r=>r.need==null)?' 数量が読めない行は「数量列を指定」も使えます。':''),'warn');
   else if(rows.some(r=>r.need==null)) showLast('数量が読めない行があります','「数量列を指定」を押して、数量の数字を1つタップしてください。','warn');
   else showLast(`${rows.length}行 読み込みました`,'JAN下6桁と数を話してください。');
 }
@@ -179,15 +227,18 @@ function pageHasJan(items){
   const t=items.map(i=>i.s).join(' ');
   return /(^|\D)(\d{13}|4[59]\d{6})(?!\d)/.test(t)||/4[59]\d{11}/.test(items.map(i=>i.s).join(''));
 }
-function findHeader(items){
+const QTY_RE=/数量|枚数|納品数|出荷数|入荷数|個数|本数/;
+function findCol(items,re){
   let joined='',starts=[];
   for(const it of items){starts.push(joined.length);joined+=it.s.replace(/\s/g,'');}
-  const m=joined.match(/数量|納品数|出荷数|個数/);
-  if(!m){const one=items.find(it=>!it.ocr&&it.s.replace(/\s/g,'')==='数');return one?one.x+one.w/2:null;}
+  const m=joined.match(re);if(!m)return null;
   const a=m.index,b=a+m[0].length-1;
-  const ia=starts.findLastIndex(st=>st<=a),ib=starts.findLastIndex(st=>st<=b);
-  const A=items[ia],B=items[ib];
-  return (A.x+B.x+B.w)/2;
+  const A=items[starts.findLastIndex(st=>st<=a)],B=items[starts.findLastIndex(st=>st<=b)];
+  return {x0:A.x,x1:B.x+B.w,cx:(A.x+B.x+B.w)/2,y:A.y};
+}
+function findHeader(items){
+  const c=findCol(items,QTY_RE);if(c)return c.cx;
+  const one=items.find(it=>!it.ocr&&it.s.replace(/\s/g,'')==='数');return one?one.x+one.w/2:null;
 }
 function janInLine(items){
   const runs=items.map(i=>i.s).join('').match(/\d{8,}/g)||[];
@@ -227,21 +278,143 @@ async function ocrPage(page,vp1,p,n){
   });
   return {items,canvas:c,sc};
 }
+/* 数字専用の読み取り(範囲はページ座標) */
+const withTO=pr=>Promise.race([pr,new Promise((_,rej)=>setTimeout(()=>rej('timeout'),30000))]);
+async function digitWords(img,x0,y0,x1,y1,k,psm,bin,white,margin){
+  const w=await withTO(getOcr()),sc=img.sc;
+  const X0=Math.max(0,x0*sc),Y0=Math.max(0,y0*sc),X1=Math.min(img.canvas.width,x1*sc),Y1=Math.min(img.canvas.height,y1*sc);
+  if(X1-X0<4||Y1-Y0<4)return [];
+  const cw=Math.max(8,Math.round((X1-X0)*k)),ch=Math.max(8,Math.round((Y1-Y0)*k)),M=margin?Math.max(10,Math.round(ch*0.5)):0;
+  const c=document.createElement('canvas');c.width=cw+M*2;c.height=ch+M*2;
+  const g=c.getContext('2d',{willReadFrequently:true});g.fillStyle='#fff';g.fillRect(0,0,c.width,c.height);g.imageSmoothingQuality='high';
+  g.drawImage(img.canvas,X0,Y0,X1-X0,Y1-Y0,M,M,cw,ch);
+  if(bin){const d=g.getImageData(0,0,c.width,c.height),a=d.data;for(let i=0;i<a.length;i+=4){const v=(a[i]*.3+a[i+1]*.59+a[i+2]*.11)<bin?0:255;a[i]=a[i+1]=a[i+2]=v;}g.putImageData(d,0,0);}
+  await w.setParameters({tessedit_char_whitelist:white||'0123456789',tessedit_pageseg_mode:psm});
+  const {data}=await w.recognize(c);
+  return (data.words||[]).map(x=>({t:(x.text||'').replace(white?/[^\d,]/g:/\D/g,''),x0:(X0+(x.bbox.x0-M)/k)/sc,x1:(X0+(x.bbox.x1-M)/k)/sc,y:(Y0+(x.bbox.y1-M)/k)/sc,h:(x.bbox.y1-x.bbox.y0)/k/sc,cf:x.confidence||0})).filter(x=>x.t);
+}
+/* インクの帯=1行(文字の読み取りに頼らず、行の位置を決める) */
+function inkBands(img,cx0,cx1){
+  const sc=img.sc,X0=Math.max(0,Math.round(cx0*sc)),W=Math.max(1,Math.min(img.canvas.width-X0,Math.round((cx1-cx0)*sc))),Hc=img.canvas.height;
+  const d=img.canvas.getContext('2d').getImageData(X0,0,W,Hc).data,ink=new Uint8Array(Hc);
+  for(let y=0;y<Hc;y++){let c=0;for(let x=0;x<W;x++){const i=(y*W+x)*4;if(d[i]*.3+d[i+1]*.59+d[i+2]*.11<140)c++;}ink[y]=(c>=Math.max(2,W*0.01)&&c<W*0.6)?1:0;}
+  const bs=[];for(let y=0;y<Hc;){if(ink[y]){const y0=y;while(y<Hc&&ink[y])y++;bs.push([y0,y]);}else y++;}
+  const gap=Math.max(2,sc*1.2),m=[];
+  for(const b of bs){if(m.length&&b[0]-m[m.length-1][1]<=gap)m[m.length-1][1]=b[1];else m.push(b);}
+  if(!m.length)return [];
+  const hs=m.map(b=>b[1]-b[0]).sort((a,b)=>a-b),med=hs[hs.length>>1];
+  return m.filter(b=>b[1]-b[0]>=med*0.5&&b[1]-b[0]<=med*2.2).map(b=>({y0:b[0]/sc,y1:b[1]/sc}));
+}
+/* 数字の高さ(px)を変えて読む。13px前後が最もよく読めた(大きすぎると3を9と読みやすい) */
+const HEIGHTS=[13,11,15,12,14,9,17,10];
+let docPrefix=null;
+/* 1行を条件を変えて何度か読む(同じ有効なJANが2回出たら打ち切り) */
+async function readJanBand(img,cx0,cx1,b){
+  const hpx=Math.max(1,(b.y1-b.y0)*img.sc),pad=(b.y1-b.y0)*0.3,reads=[],seen={};
+  for(const tg of HEIGHTS){
+    let ws=[];try{ws=await digitWords(img,cx0,b.y0-pad,cx1,b.y1+pad,tg/hpx,'7',0);}catch(e){break;}
+    for(const w of ws){
+      if(w.t.length<12)continue;
+      const t=w.t.length>14?w.t.slice(0,13):w.t;
+      reads.push(t);
+      const v=t.length===13?t:[t.slice(0,13),t.slice(1)].find(eanOk);
+      if(v&&eanOk(v)&&(seen[v]=(seen[v]||0)+1)>=2)return reads;
+    }
+  }
+  return reads;
+}
+/* 桁ごとの多数決+メーカーコード+チェックデジット */
+function voteJan(reads,pre){
+  let r13=reads.filter(r=>r.length===13);
+  if(!r13.length){const r14=reads.find(r=>r.length===14);if(r14){for(const s of [r14.slice(1),r14.slice(0,13)])if(eanOk(s))return {jan:s,bad:false};}return null;}
+  if(pre)r13=r13.map(r=>{let d=0;for(let i=0;i<7;i++)if(r[i]!==pre[i])d++;return d<=2?pre+r.slice(7):r;});
+  const pos=[...Array(13)].map((_,i)=>{const c={};r13.forEach(r=>c[r[i]]=(c[r[i]]||0)+1);return c;});
+  const top=c=>Object.keys(c).sort((a,b)=>c[b]-c[a])[0];
+  const best=pos.map(top).join('');
+  if(eanOk(best))return {jan:best,bad:false};
+  const alt=[];
+  for(let i=0;i<13;i++)for(const dg in pos[i]){const s=best.slice(0,i)+dg+best.slice(i+1);if(eanOk(s))alt.push([pos[i][dg],s]);}
+  alt.sort((a,b)=>b[0]-a[0]);
+  if(alt.length&&(alt.length===1||alt[0][0]>alt[1][0]))return {jan:alt[0][1],bad:false};
+  return {jan:best,bad:true};
+}
+/* JANの列を数字専用で読み、行を決める */
+async function ocrJanRows(img,lines,jcol,pageW,p,n){
+  showLast(`JANを読み取り中… ${p}/${n}枚目`,'','warn');
+  const H=img.canvas.height/img.sc;
+  let cx0=jcol?Math.max(0,jcol.cx-62):0,cx1=jcol?Math.min(pageW,jcol.cx+62):pageW*0.5;
+  let ws=[];try{ws=await digitWords(img,cx0,0,cx1,H,Math.max(1,Math.min(2,1600/img.canvas.height*1.5)),'6',0);}catch(e){}
+  let jw=ws.filter(w=>w.t.length>=11&&w.t.length<=14);
+  if(jw.length<2){try{ws=await digitWords(img,cx0,0,cx1,H,Math.max(1,Math.min(2,1600/img.canvas.height*1.5)),'6',170);}catch(e){}jw=ws.filter(w=>w.t.length>=11&&w.t.length<=14);}
+  if(jw.length<2)jw=lines.flatMap(l=>l.items).filter(i=>{const t=i.s.replace(/[^0-9A-Za-z]/g,'');return t.length>=11&&t.length<=15&&(t.match(/\d/g)||[]).length>=7&&i.x<pageW*0.4;}).map(i=>({x0:i.x,x1:i.x+i.w}));
+  if(jw.length>=2){
+    const s0=jw.map(w=>w.x0).sort((a,b)=>a-b),s1=jw.map(w=>w.x1).sort((a,b)=>a-b),m0=s0[s0.length>>1],m1=s1[s1.length>>1],pad=(m1-m0)*0.08;
+    cx0=Math.max(0,m0-pad);cx1=Math.min(pageW,m1+pad);
+  }
+  const bands=inkBands(img,cx0,cx1),got=[];
+  for(let i=0;i<bands.length;i++){
+    showLast(`JANを読み取り中… ${p}/${n}枚目 ${i+1}/${bands.length}`,'','warn');
+    got.push({b:bands[i],reads:await readJanBand(img,cx0,cx1,bands[i])});
+  }
+  const c7={};got.forEach(g=>g.reads.filter(r=>r.length===13&&eanOk(r)).forEach(r=>{const k=r.slice(0,7);c7[k]=(c7[k]||0)+1;}));
+  const pre=Object.keys(c7).sort((a,b)=>c7[b]-c7[a])[0];
+  if(pre&&c7[pre]>=3)docPrefix=pre;
+  const out=[];
+  for(const g of got){
+    const v=voteJan(g.reads,docPrefix);
+    if(v)out.push({...v,y:g.b.y1,h:g.b.y1-g.b.y0,y0:g.b.y0,x0:cx0,x1:cx1});
+  }
+  out.bands=bands;out.cx0=cx0;
+  return out;
+}
+/* 読み違えたJANを、同じ納品書で一番多いメーカーコード(先頭7桁)で補正 */
+function fixByPrefix(){
+  const cnt={};rows.filter(r=>!r.bad&&r.jan.length===13).forEach(r=>{const k=r.jan.slice(0,7);cnt[k]=(cnt[k]||0)+1;});
+  const pre=Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a])[0];
+  if(!pre||cnt[pre]<3)return;
+  for(const r of rows){
+    if(!r.bad||r.jan.length!==13)continue;
+    let diff=0;for(let i=0;i<7;i++)if(r.jan[i]!==pre[i])diff++;
+    const fixed=pre+r.jan.slice(7);
+    if(diff&&diff<=2&&eanOk(fixed)){r.jan=fixed;r.jan6=fixed.slice(-6);r.bad=false;}
+  }
+}
 /* 数量の欄だけ、数字専用でもう一度読む(日本語の読み取りは短い数字をカナと取り違えるため) */
-async function ocrQty(img,r,hx){
-  try{
-    const w=await Promise.race([getOcr(),new Promise((_,rej)=>setTimeout(()=>rej('timeout'),30000))]),sc=img.sc;
-    const x0=Math.max(0,(hx-55)*sc),x1=Math.min(img.canvas.width,(hx+50)*sc);
-    const y0=Math.max(0,(r.y-r.h*1.4)*sc),y1=Math.min(img.canvas.height,(r.y+r.h*0.5)*sc);
-    const k=2,c=document.createElement('canvas');c.width=Math.round((x1-x0)*k);c.height=Math.round((y1-y0)*k);
-    const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,c.width,c.height);
-    g.drawImage(img.canvas,x0,y0,x1-x0,y1-y0,0,0,c.width,c.height);
-    await w.setParameters({tessedit_char_whitelist:'0123456789,.',tessedit_pageseg_mode:'7'});
-    const {data}=await w.recognize(c);
-    await w.setParameters({tessedit_char_whitelist:'0123456789',tessedit_pageseg_mode:'6'});
-    const m=(data.text||'').replace(/(\d)[.,](\d{3})(?!\d)/g,'$1$2').match(/\d{1,5}/);
-    return m?+m[0]:null;
-  }catch(e){return null;}
+async function ocrQty(img,r,col){
+  const hh=Math.max(r.h||8,6),y0=r.y0!=null?r.y0:r.y-hh,pad=hh*0.35;
+  const hpx=Math.max(1,(r.y-y0)*img.sc),vals={},wt={};
+  for(const [tg,mg] of [[13,0],[13,1],[18,1],[11,0],[14,0],[16,1],[22,1],[12,0],[15,1],[16,0]]){
+    let ws=[];
+    try{ws=await digitWords(img,col.x0-14,y0-pad,col.x1+14,r.y+pad,tg/hpx,'7',0,'0123456789,',mg);}catch(e){return null;}
+    ws.sort((a,b)=>a.x1-b.x1);
+    let t='',cf=0;
+    if(ws.length){
+      let i=ws.length-1;t=ws[i].t;cf=ws[i].cf;
+      while(i>0&&(ws[i].x0-ws[i-1].x1)<Math.max(ws[i].h,ws[i-1].h)*0.45&&(t+ws[i-1].t).replace(/,/g,'').length<=4){t=ws[i-1].t+t;cf=Math.min(cf,ws[i-1].cf);i--;}
+      if(i>0&&/^\d{3}$/.test(t)&&/,$/.test(ws[i-1].t))t=ws[i-1].t+t;
+    }
+    t=t.replace(/,/g,'');
+    if(/^\d{1,5}$/.test(t)){
+      vals[t]=(vals[t]||0)+1;wt[t]=(wt[t]||0)+Math.max(cf,1);
+      if(vals[t]>=4)break;
+    }
+  }
+  let k=Object.keys(wt).sort((a,b)=>wt[b]-wt[a])[0];
+  if(k!=null&&vals['1'+k]>=2)k='1'+k;   // 小さい字は先頭の「1」を落としやすい
+  if(r&&typeof r==='object')r.alts=Object.keys(vals).map(Number).filter(v=>v!==+k);
+  return k!=null?+k:null;
+}
+/* 納品書の「合計」と照合して、手書きの✓が数字に化けた行などを直す */
+function reconcile(prs,total){
+  const known=prs.filter(r=>r.need!=null),sum=known.reduce((a,r)=>a+r.need,0),nul=prs.filter(r=>r.need==null);
+  if(nul.length===1&&total-sum>0){nul[0].need=total-sum;return true;}
+  if(nul.length)return sum===total;
+  if(sum===total)return true;
+  const diff=sum-total,fix=known.filter(r=>{const t=String(r.need);return t.length>=2&&r.need-+t.slice(1)===diff;});
+  if(fix.length===1){fix[0].need=+String(fix[0].need).slice(1);return true;}
+  const alt=[];known.forEach(r=>(r.alts||[]).forEach(v=>{if(r.need-v===diff)alt.push([r,v]);}));
+  if(alt.length===1){alt[0][0].need=alt[0][1];return true;}
+  return false;
 }
 
 function qtyAt(r,hx){
@@ -264,6 +437,18 @@ function onPageTap(p,e){
   const P=pagesInfo[p-1],rect=P.wrap.getBoundingClientRect();
   const x=(e.clientX-rect.left)/P.scale,y=(e.clientY-rect.top)/P.scale;
   const r=rows.filter(r=>r.page===p).find(r=>y>r.y-r.h*1.1&&y<r.y+r.h*0.5);
+  if(pickCol&&P.ocrImg){
+    if(!r)return;
+    pickCol=false;document.body.classList.remove('pick');
+    const col={x0:x-22,x1:x+22};
+    showLast('数量を読み直し中…','','warn');
+    (async()=>{
+      for(const q of rows){const Q=pagesInfo[q.page-1];if(Q.ocrImg){const v=await ocrQty(Q.ocrImg,q,col);if(v!=null)q.need=v;}}
+      save();redrawAll();updateStatus();
+      showLast('数量列を設定しました',rows.some(r=>r.need==null)?'まだ読めない行は、行をタップして数量を入れてください。':'');
+    })();
+    return;
+  }
   if(pickCol){
     if(!r)return;
     let best=null,bd=1e9;
@@ -293,6 +478,10 @@ function onPageTap(p,e){
 function findRow(j6,full){
   let c=full?rows.filter(r=>r.jan===full):[];
   if(!c.length)c=rows.filter(r=>r.jan6===j6);
+  if(!c.length){
+    const near=rows.filter(r=>r.bad&&[...r.jan6].filter((d,i)=>d!==j6[i]).length<=1);
+    if(near.length===1){const r=near[0];r.jan=r.jan.slice(0,-6)+j6;r.jan6=j6;r.bad=false;save();c=[r];}
+  }
   if(!c.length)return null;
   return c.find(r=>r.need==null||r.got<r.need)||c[c.length-1];
 }
@@ -465,8 +654,7 @@ async function getOcr(){
   if(ocrWorker)return ocrWorker;
   if(!ocrLoading)ocrLoading=(async()=>{
     if(!window.Tesseract)await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
-    const w=await Tesseract.createWorker('eng');
-    await w.setParameters({tessedit_char_whitelist:'0123456789',tessedit_pageseg_mode:'6'});
+    const w=await Tesseract.createWorker('eng',1,{langPath:'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main',gzip:false});
     ocrWorker=w;return w;
   })().catch(e=>{ocrLoading=null;throw e;});
   return ocrLoading;
@@ -482,7 +670,7 @@ async function ocrLoop(v){
   const c=document.createElement('canvas');
   while(stream&&ocrOn){
     if(grabBand(v,c,Math.min(1,900/(v.videoWidth||900)))){
-      try{const {data}=await w.recognize(c);const code=pickJan(data.text);if(code)hit(code);}catch(e){}
+      try{await w.setParameters({tessedit_char_whitelist:'0123456789',tessedit_pageseg_mode:'6'});const {data}=await w.recognize(c);const code=pickJan(data.text);if(code)hit(code);}catch(e){}
     }
     await new Promise(r=>setTimeout(r,250));
   }
