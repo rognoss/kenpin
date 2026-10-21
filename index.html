@@ -110,7 +110,7 @@ async function openPdf(file){
   key='kenpin:'+file.name+':'+file.size;
   pagesEl.innerHTML='';rows=[];pagesInfo=[];log=[];pending=null;lastRow=null;
   const W=Math.min(pagesEl.clientWidth-8,1200);
-  let lastHeaderX=null,usedOcr=false,ocrFailed=false,lastQcol=null,lastJcol=null;const sumWarn=[],ocrPages=[];let okPages=0;
+  let lastHeaderX=null,usedOcr=false,ocrFailed=false,lastQcol=null,lastJcol=null;const sumWarn=[],ocrPages=[];let okPages=0,docHit=null;
   for(let p=1;p<=pdf.numPages;p++){
     const page=await pdf.getPage(p);
     const vp1=page.getViewport({scale:1});
@@ -195,28 +195,52 @@ async function openPdf(file){
   for(const o of ocrPages){
     const src=ocrPages.find(x=>x.qcol===docQ);
     const dx=(src&&o.found.cx0!=null&&src.found.cx0!=null)?o.found.cx0-src.found.cx0:0;
-    const q=(o.qcol&&!o.qcol.weak)?o.qcol:(docQ?{...docQ,x0:docQ.x0+dx,x1:docQ.x1+dx,cx:docQ.cx+dx}:o.qcol);
-    if(!q)continue;
-    pagesInfo[o.p-1].qcol=q;
+    let q=(o.qcol&&!o.qcol.weak)?o.qcol:(docQ?{...docQ,x0:docQ.x0+dx,x1:docQ.x1+dx,cx:docQ.cx+dx}:o.qcol);
     const prs=rows.filter(r=>r.page===o.p);
-    for(let i=0;i<prs.length;i++){
-      showLast(`枚数を読み取り中… ${o.p}/${pdf.numPages}枚目 ${i+1}/${prs.length}`,'','warn');
-      prs[i].need=await ocrQty(o.ocrImg,prs[i],q);
-    }
     if(!prs.length)continue;
     const last=o.found[o.found.length-1],nb=(o.found.bands||[]).find(b=>b.y0>last.y+2);
     const tl=o.lines.find(l=>/合計/.test(l.items.map(i=>i.s).join('')));
     const tb=tl?{y:tl.y,h:Math.max(tl.h,8)}:(nb&&nb.y0-last.y<last.h*4?{y:nb.y1,y0:nb.y0,h:nb.y1-nb.y0}:null);
-    const t=tb?await ocrQty(o.ocrImg,tb,q):null;
-    const mx=Math.max(0,...prs.map(r=>r.need||0));
-    if(t!=null&&t>=mx&&prs.length>1){
-      if(reconcile(prs,t))okPages++;
-      else sumWarn.push(`${o.p}枚目 合計${t}・読取${prs.reduce((a,r)=>a+(r.need||0),0)}`);
+    const readAll=async col=>{
+      for(let i=0;i<prs.length;i++){
+        showLast(`枚数を読み取り中… ${o.p}/${pdf.numPages}枚目 ${i+1}/${prs.length}`,'','warn');
+        prs[i].need=await ocrQty(o.ocrImg,prs[i],col);
+      }
+      const t=tb?await ocrQty(o.ocrImg,tb,col.lp!=null?{...col,lp:(col.x1-col.x0)*1.3}:col):null;
+      const mx=Math.max(0,...prs.map(r=>r.need||0));
+      return (t!=null&&t>=mx&&prs.length>1)?t:null;
+    };
+    let dq=null;
+    const sh=c=>{const d=(o.found.cx0!=null&&c.cx0!=null)?o.found.cx0-c.cx0:0;return {...c.col,x0:c.col.x0+d,x1:c.col.x1+d,cx:c.col.cx+d};};
+    if(!q||q.weak){
+      dq=tb?await detectQtyCol(o,prs,tb):null;
+      if(dq&&dq.hit)q=dq;
+      else if(docHit)q=sh(docHit);
+      else if(dq)q=dq;
     }
+    if(!q)continue;
+    let t=await readAll(q);
+    let ok=t!=null&&reconcile(prs,t);
+    const unread=prs.filter(r=>r.need==null).length;
+    if(!ok&&(t!=null||unread>prs.length*0.3)){
+      if(!dq)dq=await detectQtyCol(o,prs,tb);
+      if(dq&&Math.abs(dq.cx-q.cx)>4){
+        const keep=prs.map(r=>[r.need,r.alts]);
+        const t2=await readAll(dq),ok2=t2!=null&&reconcile(prs,t2);
+        const unread2=prs.filter(r=>r.need==null).length;
+        if(ok2||(!ok&&unread2<unread)){q=dq;t=t2;ok=ok2;}
+        else prs.forEach((r,i)=>{r.need=keep[i][0];r.alts=keep[i][1];});
+      }
+    }
+    pagesInfo[o.p-1].qcol=q;
+    if(ok&&q.lp!=null&&!docHit)docHit={col:q,cx0:o.found.cx0};
+    if(t!=null){if(ok)okPages++;else sumWarn.push(`${o.p}枚目 合計${t}・読取${prs.reduce((a,r)=>a+(r.need||0),0)}`);}
   }
+
   restore();
   redrawAll();updateStatus();
   if(!rows.length) showLast('JANが見つかりません',ocrFailed?'読み取りの部品を読み込めませんでした。電波のある所でもう一度開いてください。':'スキャンが薄い・傾いている可能性があります。読めない行はJANと数を手入力してください。','ng');
+  else if(rows.filter(r=>r.need==null).length>rows.length*0.3){pickCol=true;document.body.classList.add('pick');showLast('数量の列が分かりませんでした','数量の数字を1つタップしてください(どの行でも可)。その列で全行を読み直します。','warn');}
   else if(usedOcr&&sumWarn.length) showLast(`スキャンから${rows.length}行 読み取り(合計が合いません)`,sumWarn.join('、')+'。「数量?」や数の違う行をタップして直してください。','ng');
   else if(usedOcr) showLast(`スキャンから${rows.length}行 読み取りました`+(okPages&&!rows.some(r=>r.bad||r.need==null)?'(合計も一致)':''),'読み違いがあり得ます。紫の「JAN?」・青の「数量?」の行はタップして直してください。'+(rows.some(r=>r.need==null)?' 数量が読めない行は「数量列を指定」も使えます。':''),'warn');
   else if(rows.some(r=>r.need==null)) showLast('数量が読めない行があります','「数量列を指定」を押して、数量の数字を1つタップしてください。','warn');
@@ -364,7 +388,7 @@ async function ocrJanRows(img,lines,jcol,pageW,p,n){
     const v=voteJan(g.reads,docPrefix);
     if(v)out.push({...v,y:g.b.y1,h:g.b.y1-g.b.y0,y0:g.b.y0,x0:cx0,x1:cx1});
   }
-  out.bands=bands;out.cx0=cx0;
+  out.bands=bands;out.cx0=cx0;out.cx1=cx1;
   return out;
 }
 /* 読み違えたJANを、同じ納品書で一番多いメーカーコード(先頭7桁)で補正 */
@@ -385,7 +409,7 @@ async function ocrQty(img,r,col){
   const hpx=Math.max(1,(r.y-y0)*img.sc),vals={},wt={};
   for(const [tg,mg] of [[13,0],[13,1],[18,1],[11,0],[14,0],[16,1],[22,1],[12,0],[15,1],[16,0]]){
     let ws=[];
-    try{ws=await digitWords(img,col.x0-14,y0-pad,col.x1+14,r.y+pad,tg/hpx,'7',0,'0123456789,',mg);}catch(e){return null;}
+    try{ws=await digitWords(img,col.x0-(col.lp!=null?col.lp:14),y0-pad,col.x1+(col.rp!=null?col.rp:14),r.y+pad,tg/hpx,'7',0,'0123456789,',mg);}catch(e){return null;}
     ws.sort((a,b)=>a.x1-b.x1);
     let t='',cf=0;
     if(ws.length){
@@ -403,6 +427,51 @@ async function ocrQty(img,r,col){
   if(k!=null&&vals['1'+k]>=2)k='1'+k;   // 小さい字は先頭の「1」を落としやすい
   if(r&&typeof r==='object')r.alts=Object.keys(vals).map(Number).filter(v=>v!==+k);
   return k!=null?+k:null;
+}
+/* 見出しに頼らず、中身から数量の列を探す:右端がそろった数字の列のうち、合計欄と一致するもの */
+async function detectQtyCol(o,prs,tb){
+  const img=o.ocrImg,sc=img.sc,W=img.canvas.width,xs=Math.round(((o.found.cx1||0)+2)*sc),g=img.canvas.getContext('2d');
+  const n=prs.length;if(n<2)return null;
+  // 1) インクの横方向の分布で、列の切れ目を見つける(塗りつぶし・縦罫線は切れ目扱い)
+  const prof=new Float32Array(W);let hsum=0;
+  for(const r of prs){
+    const y0=Math.round((r.y0!=null?r.y0:r.y-r.h)*sc),hh=Math.max(1,Math.round(r.y*sc)-y0);hsum+=hh;
+    const Y0=Math.max(0,Math.round(y0-hh*0.6)),H=Math.min(img.canvas.height-Y0,Math.round(hh*2.2)),d=g.getImageData(0,Y0,W,H).data,off=y0-Y0;
+    for(let x=xs;x<W;x++){let c=0,ci=0;for(let y=0;y<H;y++){const i=(y*W+x)*4;if(d[i]*.3+d[i+1]*.59+d[i+2]*.11<150){c++;if(y>=off&&y<off+hh)ci++;}}
+      if(c>=H*0.9)prof[x]-=1000;else if(ci>0)prof[x]+=1;}
+  }
+  const hpx=hsum/n,thr=Math.max(1,n*0.08),segs=[];
+  for(let x=xs;x<W;){if(prof[x]>=thr){const a=x;while(x<W&&prof[x]>=thr)x++;segs.push([a,x]);}else x++;}
+  const m=[];for(const sg of segs){const L=m[m.length-1];if(L&&sg[0]-L[1]<hpx*0.6&&!prof.slice(L[1],sg[0]).some(v=>v<0))L[1]=sg[1];else m.push(sg.slice());}
+  const cols=m.filter(sg=>sg[1]-sg[0]>=hpx*0.4).map(sg=>({x0:sg[0]/sc,x1:sg[1]/sc}));
+  // 2) 列ごとに数字を読み、合計欄と一致する列を選ぶ
+  const readCell=async(r,c,extra)=>{
+    const y0=r.y0!=null?r.y0:r.y-r.h,hh=Math.max(r.y-y0,4);
+    let ws=[];try{ws=await digitWords(img,c.x0-1-(extra||0),y0-hh*0.35,c.x1+0.3,r.y+hh*0.35,13/Math.max(1,hh*sc),'7',0,'0123456789,',1);}catch(e){}
+    ws.sort((a,b)=>a.x1-b.x1);if(!ws.length)return null;
+    let i=ws.length-1,t=ws[i].t;
+    while(i>0&&(ws[i].x0-ws[i-1].x1)<Math.max(ws[i].h,ws[i-1].h)*0.45&&(t+ws[i-1].t).replace(/,/g,'').length<=5){t=ws[i-1].t+t;i--;}
+    t=t.replace(/,/g,'');return /^\d{1,5}$/.test(t)?+t:null;
+  };
+  let best=null;
+  for(let ci=0;ci<cols.length;ci++){
+    const c=cols[ci];
+    showLast(`数量の列を探しています… ${o.p}枚目 ${ci+1}/${cols.length}`,'','warn');
+    const probe=[];for(let i=0;i<Math.min(3,n);i++)probe.push(await readCell(prs[i],c));
+    if(probe.filter(v=>v!=null).length<2)continue;
+    const vals=probe.slice();for(let i=probe.length;i<n;i++)vals.push(await readCell(prs[i],c));
+    const got=vals.filter(v=>v!=null);if(got.length<n*0.6)continue;
+    const sum=got.reduce((a,b)=>a+b,0);
+    const tot=tb?await readCell(tb,c,(c.x1-c.x0)):null;
+    let score=got.length/n,hit=false;
+    if(tot===sum){score+=10;hit=true;}else if(tot!=null&&Math.abs(tot-sum)<=Math.max(2,sum*0.08))score+=3;
+    if(got.every(v=>v>0&&v<=999))score+=0.5;
+    if(new Set(got).size===1)score-=0.7;
+    if(got.some(v=>v>=10000))score-=1;
+    if(!best||score>best.score)best={score,hit,x0:c.x0,x1:c.x1,cx:(c.x0+c.x1)/2,lp:Math.max(2,(c.x1-c.x0)*0.45),rp:0.3};
+    if(hit)break;
+  }
+  return best&&(best.hit||best.score>=1.2)?best:null;
 }
 /* 納品書の「合計」と照合して、手書きの✓が数字に化けた行などを直す */
 function reconcile(prs,total){
@@ -422,8 +491,8 @@ function qtyAt(r,hx){
   let best=null,bd=1e9;
   for(const it of r.items){
     if(it.s.includes(r.jan))continue;
-    const v=it.s.replace(/(\d)[.](\d{3})(?!\d)/,'$1$2').replace(/[,個本枚点]/g,'');
-    if(!/^\d{1,5}$/.test(v))continue;
+    let v=it.s.replace(/(\d)[.](\d{3})(?!\d)/,'$1$2').replace(/[,個本枚点]/g,'');
+    if(!/^\d{1,5}$/.test(v)){const m=v.match(/^[^\d]{1,3}(\d{1,5})$/);if(!m)continue;v=m[1];}
     if(it.ocr&&v.length>=4&&r.jan.includes(v))continue;
     const d=Math.abs(it.x+it.w/2-hx);
     if(d<bd){bd=d;best=+v;}
